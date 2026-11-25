@@ -1,6 +1,9 @@
 using System.Text.Json.Serialization;
+using Microsoft.AspNetCore.SignalR;
 
 var builder = WebApplication.CreateBuilder(args);
+builder.Services.AddSignalR();
+
 var app = builder.Build();
 
 var documents = new List<Document>
@@ -100,8 +103,14 @@ app.MapPost("/documents", (DocumentRequest? request) =>
     return Results.Created($"/documents/{document.Id}", ToSummary(document));
 });
 
-app.MapPost("/documents/{id:guid}/submit", (Guid id, SubmitRequest? request) =>
+app.MapPost("/documents/{id:guid}/submit", async (
+    Guid id,
+    SubmitRequest? request,
+    IHubContext<DocumentHub> hubContext) =>
 {
+    DocumentDetailResponse detail;
+    DocumentStatusChangedMessage message;
+
     lock (documentsLock)
     {
         var document = documents.FirstOrDefault(d => d.Id == id);
@@ -126,25 +135,43 @@ app.MapPost("/documents/{id:guid}/submit", (Guid id, SubmitRequest? request) =>
         var previousStatus = document.Status;
         document.Status = Statuses.Submitted;
         document.Reviewer = request.Reviewer.Trim();
-        document.History.Add(new HistoryEntry(
+
+        var entry = new HistoryEntry(
             "submit",
             previousStatus,
             document.Status,
             document.CreatedBy,
-            DateTime.UtcNow));
+            DateTime.UtcNow);
+        document.History.Add(entry);
 
-        return Results.Ok(ToDetail(document));
+        detail = ToDetail(document);
+        message = ToStatusMessage(document.Id, entry);
     }
+
+    await PublishStatusChangedAsync(hubContext, message);
+
+    return Results.Ok(detail);
 });
 
-app.MapPost("/documents/{id:guid}/approve", (Guid id) => Transition(id, "approve", Statuses.Approved));
+app.MapPost("/documents/{id:guid}/approve", (Guid id, IHubContext<DocumentHub> hubContext) =>
+    TransitionAsync(id, "approve", Statuses.Approved, hubContext));
 
-app.MapPost("/documents/{id:guid}/reject", (Guid id) => Transition(id, "reject", Statuses.Rejected));
+app.MapPost("/documents/{id:guid}/reject", (Guid id, IHubContext<DocumentHub> hubContext) =>
+    TransitionAsync(id, "reject", Statuses.Rejected, hubContext));
+
+app.MapHub<DocumentHub>("/hubs/documents");
 
 app.Run();
 
-IResult Transition(Guid id, string action, string targetStatus)
+async Task<IResult> TransitionAsync(
+    Guid id,
+    string action,
+    string targetStatus,
+    IHubContext<DocumentHub> hubContext)
 {
+    DocumentDetailResponse detail;
+    DocumentStatusChangedMessage message;
+
     lock (documentsLock)
     {
         var document = documents.FirstOrDefault(d => d.Id == id);
@@ -160,16 +187,45 @@ IResult Transition(Guid id, string action, string targetStatus)
 
         var previousStatus = document.Status;
         document.Status = targetStatus;
-        document.History.Add(new HistoryEntry(
+
+        var entry = new HistoryEntry(
             action,
             previousStatus,
             targetStatus,
             document.Reviewer!,
-            DateTime.UtcNow));
+            DateTime.UtcNow);
+        document.History.Add(entry);
 
-        return Results.Ok(ToDetail(document));
+        detail = ToDetail(document);
+        message = ToStatusMessage(document.Id, entry);
+    }
+
+    await PublishStatusChangedAsync(hubContext, message);
+
+    return Results.Ok(detail);
+}
+
+async Task PublishStatusChangedAsync(
+    IHubContext<DocumentHub> hubContext,
+    DocumentStatusChangedMessage message)
+{
+    try
+    {
+        await hubContext.Clients
+            .Group(DocumentGroups.For(message.DocumentId))
+            .SendAsync("DocumentStatusChanged", message);
+    }
+    catch (Exception ex)
+    {
+        app.Logger.LogError(
+            ex,
+            "Không gửi được sự kiện DocumentStatusChanged cho tài liệu {DocumentId}.",
+            message.DocumentId);
     }
 }
+
+static DocumentStatusChangedMessage ToStatusMessage(Guid documentId, HistoryEntry entry) =>
+    new(documentId, entry.Action, entry.FromStatus, entry.ToStatus, entry.Actor, entry.Timestamp);
 
 static IResult DocumentNotFound(Guid id) =>
     Results.NotFound(new ErrorResponse(
@@ -216,6 +272,14 @@ record DocumentDetailResponse(
 
 record HistoryEntry(string Action, string FromStatus, string ToStatus, string Actor, DateTime Timestamp);
 
+record DocumentStatusChangedMessage(
+    Guid DocumentId,
+    string Action,
+    string FromStatus,
+    string ToStatus,
+    string Actor,
+    DateTime Timestamp);
+
 record ErrorResponse(
     string Code,
     string Message,
@@ -230,6 +294,17 @@ static class Statuses
     public const string Submitted = "Submitted";
     public const string Approved = "Approved";
     public const string Rejected = "Rejected";
+}
+
+public static class DocumentGroups
+{
+    public static string For(Guid documentId) => $"document:{documentId:N}";
+}
+
+public sealed class DocumentHub : Hub
+{
+    public Task WatchDocument(Guid documentId) =>
+        Groups.AddToGroupAsync(Context.ConnectionId, DocumentGroups.For(documentId));
 }
 
 sealed class Document
